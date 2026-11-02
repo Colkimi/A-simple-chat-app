@@ -1,0 +1,43 @@
+# Dependencies
+**/node_modules/
+
+# Build output and caches
+**/dist/
+**/coverage/
+**/.cache/
+**/.turbo/
+**/*.tsbuildinfo
+**/.vite/
+
+# Environment files and secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/keys/
+**/*.pem
+**/*.key
+
+# Logs and runtime files
+**/logs/
+**/*.log
+**/npm-debug.log*
+**/pnpm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+
+# Local databases and uploads
+**/*.sqlite
+**/*.sqlite3
+**/uploads/
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.swp
+*.swo
