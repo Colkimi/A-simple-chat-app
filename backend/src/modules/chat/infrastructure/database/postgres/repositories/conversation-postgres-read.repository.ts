@@ -1,0 +1,381 @@
+import { MessageReadDto } from '@modules/chat/application/dtos/message-read.dto';
+import { ConversationReadDto } from '@modules/chat/application/dtos/conversation-read.dto';
+import { Injectable } from '@nestjs/common';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, In, Repository, SelectQueryBuilder } from 'typeorm';
+import { DatabaseType } from '@infrastructure/database/database-type.enum';
+import { Message } from '@modules/chat/infrastructure/database/postgres/entities/message.entity';
+import { ConversationReadRepositoryPort } from '@modules/chat/application/ports/conversation-read-repository.port';
+import { Conversation } from '@modules/chat/infrastructure/database/postgres/entities/conversation.entity';
+import { GetUserConversationIdsOptions } from '@modules/chat/application/ports/options/get-user-conversation-ids.options';
+import { GetUserConversationListOptions } from '@modules/chat/application/ports/options/get-user-conversation-list.options';
+import { ConversationMember } from '@modules/chat/infrastructure/database/postgres/entities/conversation-member.entity';
+import { DeletedMessage } from '@modules/chat/infrastructure/database/postgres/entities/deleted-message.entity';
+import {
+  PaginatedResult,
+  PaginationOptions,
+} from '@common/pagination/pagination.interface';
+import { PaginationHelper } from '@common/pagination/pagination.helper';
+
+function formatDateToIso(
+  date: Date | string | null | undefined,
+): string | null {
+  if (!date) return null;
+  if (typeof date === 'string') return date;
+  if (date instanceof Date) return date.toISOString();
+  return new Date(date).toISOString();
+}
+
+@Injectable()
+export class ConversationPostgresReadRepository implements ConversationReadRepositoryPort {
+  constructor(
+    @InjectRepository(Conversation, DatabaseType.POSTGRES)
+    private readonly conversationRepository: Repository<Conversation>,
+    @InjectRepository(Message, DatabaseType.POSTGRES)
+    private readonly messageRepository: Repository<Message>,
+    @InjectRepository(ConversationMember, DatabaseType.POSTGRES)
+    private readonly conversationMemberRepository: Repository<ConversationMember>,
+    @InjectDataSource(DatabaseType.POSTGRES)
+    private readonly dataSource: DataSource,
+  ) {}
+
+  async conversationExists(
+    userId: string,
+    targetUserId: string,
+  ): Promise<boolean> {
+    const res = await this.conversationRepository
+      .createQueryBuilder('c')
+      .innerJoin('c.conversationMembers', 'cm', 'cm.user_id = :userId', {
+        userId,
+      })
+      .where('c.type = :type', { type: 'DIRECT' })
+      .andWhereExists(
+        this.conversationMemberRepository
+          .createQueryBuilder('target_cm')
+          .where('target_cm.conversation_id = c.id')
+          .andWhere('target_cm.user_id = :targetUserId', { targetUserId }),
+      )
+      .getExists();
+
+    return res;
+  }
+
+  async getUserConversationList(
+    userId: string,
+    options: GetUserConversationListOptions,
+  ): Promise<PaginatedResult<ConversationReadDto>> {
+    const query = this.conversationRepository
+      .createQueryBuilder('c')
+      .innerJoinAndSelect(
+        'c.conversationMembers',
+        'cm',
+        'cm.user_id = :userId',
+        { userId },
+      )
+      .leftJoinAndSelect('cm.lastSeenMessage', 'lastSeenMessage');
+
+    if (options.withLastMessage) {
+      query
+        .leftJoinAndSelect('cm.lastMessage', 'lastMessage')
+        .leftJoinAndSelect('lastMessage.sender', 'lastMessageSender');
+    }
+
+    if (options.filterUserIds && options.filterUserIds.length > 0) {
+      query.andWhereExists(
+        this.conversationMemberRepository
+          .createQueryBuilder('cm_filter')
+          .where('cm_filter.user_id IN (:...userIds)', {
+            userIds: options.filterUserIds,
+          })
+          .andWhere('cm_filter.conversation_id = c.id'),
+      );
+    }
+
+    if (options.type != null) {
+      query.andWhere('c.type = :type', { type: options.type });
+    }
+
+    if (options.pagination) {
+      query.offset(options.pagination.offset).limit(options.pagination.limit);
+    }
+
+    if (options.withLastMessage) {
+      query.orderBy('lastMessage.created_at', 'DESC');
+    } else {
+      query.orderBy('c.created_at', 'DESC');
+    }
+
+    const [conversations, count] = await query.getManyAndCount();
+
+    if (conversations.length === 0) {
+      return PaginationHelper.createResult([], count, options.pagination);
+    }
+
+    const conversationIds = conversations.map((c) => c.id);
+
+    // Fetch not seen counts
+    const notSeenCountsQuery = await this.conversationMemberRepository
+      .createQueryBuilder('cm')
+      .select('cm.conversation_id', 'conversationId')
+      .where('cm.user_id = :userId', { userId })
+      .andWhere('cm.conversation_id IN (:...conversationIds)', {
+        conversationIds,
+      })
+      .addSelect(
+        (qb: SelectQueryBuilder<any>) =>
+          qb
+            .select('COUNT(m.id) - COUNT(dm.message_id)')
+            .from(Message, 'm')
+            .leftJoin(
+              DeletedMessage,
+              'dm',
+              'm.id = dm.message_id AND dm.user_id = :userId',
+              { userId },
+            )
+            .where('m.conversation_id = cm.conversation_id')
+            .andWhere('m.deleted_at IS NULL')
+            .andWhere(
+              '(cm.last_seen_message_id IS NULL OR m.id > cm.last_seen_message_id)',
+            ),
+        'notSeenCount',
+      )
+      .getRawMany();
+
+    const notSeenCountsMap = new Map<string, number>();
+    notSeenCountsQuery.forEach((row) => {
+      notSeenCountsMap.set(
+        row.conversationId,
+        parseInt(row.notSeenCount, 10) || 0,
+      );
+    });
+
+    // Map to DTOs
+    const dtos: ConversationReadDto[] = conversations.map((conv) => {
+      const currentMember = conv.conversationMembers.find(
+        (cm) => cm.user_id === userId,
+      );
+
+      return {
+        id: conv.id,
+        type: conv.type,
+        identifier: conv.identifier,
+        title: conv.title,
+        picture: conv.picture,
+        createdAt: formatDateToIso(conv.created_at)!,
+        updatedAt: formatDateToIso(conv.updated_at)!,
+        notSeenCount: notSeenCountsMap.get(conv.id) || 0,
+        lastMessage: currentMember?.lastMessage
+          ? {
+              id: currentMember.lastMessage.id,
+              text: currentMember.lastMessage.deleted_at
+                ? ''
+                : currentMember.lastMessage.text,
+              type: currentMember.lastMessage.type,
+              senderId: currentMember.lastMessage.sender
+                ? currentMember.lastMessage.sender.user_id
+                : currentMember.lastMessage.sender_id,
+              createdAt: formatDateToIso(currentMember.lastMessage.created_at)!,
+            }
+          : null,
+        members: conv.conversationMembers.map((cm) => ({
+          id: cm.id,
+          userId: cm.user_id,
+          lastSeenMessageId: cm.last_seen_message_id,
+          lastSeenMessage: cm.lastSeenMessage
+            ? {
+                createdAt: formatDateToIso(cm.lastSeenMessage.created_at)!,
+              }
+            : null,
+          lastMessageId: cm.last_message_id,
+        })),
+      };
+    });
+
+    // Populate other members for direct conversations manually if needed
+    const allMembers = await this.conversationMemberRepository
+      .createQueryBuilder('cm')
+      .leftJoinAndSelect('cm.lastSeenMessage', 'lastSeenMessage')
+      .where('cm.conversation_id IN (:...conversationIds)', { conversationIds })
+      .andWhere('cm.user_id != :userId', { userId })
+      .getMany();
+
+    dtos.forEach((dto) => {
+      const membersForThisConv = allMembers.filter(
+        (m) => m.conversation_id === dto.id && m.user_id !== userId,
+      );
+      membersForThisConv.forEach((m) => {
+        dto.members.push({
+          id: m.id,
+          userId: m.user_id,
+          lastSeenMessageId: m.last_seen_message_id,
+          lastSeenMessage: m.lastSeenMessage
+            ? {
+                createdAt: formatDateToIso(m.lastSeenMessage.created_at)!,
+              }
+            : null,
+          lastMessageId: m.last_message_id,
+        });
+      });
+    });
+
+    return PaginationHelper.createResult(dtos, count, options.pagination);
+  }
+
+  async getUserConversationIds(
+    userId: string,
+    options: GetUserConversationIdsOptions,
+  ): Promise<string[]> {
+    const query = this.conversationRepository
+      .createQueryBuilder('c')
+      .select('c.id', 'id')
+      .innerJoin('c.conversationMembers', 'cm', 'cm.user_id = :userId', {
+        userId,
+      });
+
+    if (options.type != null) {
+      query.andWhere('c.type = :type', { type: options.type });
+    }
+
+    const res = await query.getMany().then((rows) => rows.map((c) => c.id));
+
+    return res;
+  }
+
+  async getUserConversationById(
+    conversationId: string,
+    userId: string,
+  ): Promise<ConversationReadDto | null> {
+    const res = await this.conversationRepository
+      .createQueryBuilder('c')
+      .innerJoinAndSelect('c.conversationMembers', 'cm')
+      .leftJoinAndSelect('cm.lastSeenMessage', 'lsm')
+      .where('c.id = :conversationId', { conversationId })
+      .andWhereExists(
+        this.conversationMemberRepository
+          .createQueryBuilder('sub_cm')
+          .where('sub_cm.user_id = :userId', { userId })
+          .andWhere('sub_cm.conversation_id = c.id'),
+      )
+      .getOne();
+
+    if (!res) {
+      return null;
+    }
+
+    const dto: ConversationReadDto = {
+      id: res.id,
+      type: res.type,
+      identifier: res.identifier,
+      title: res.title,
+      picture: res.picture,
+      createdAt: formatDateToIso(res.created_at)!,
+      updatedAt: formatDateToIso(res.updated_at)!,
+      notSeenCount: 0,
+      lastMessage: null,
+      members: res.conversationMembers.map((cm) => ({
+        id: cm.id,
+        userId: cm.user_id,
+        lastSeenMessageId: cm.last_seen_message_id,
+        lastSeenMessage: cm.lastSeenMessage
+          ? {
+              createdAt: formatDateToIso(cm.lastSeenMessage.created_at)!,
+            }
+          : null,
+        lastMessageId: cm.last_message_id,
+      })),
+    };
+
+    return dto;
+  }
+
+  async getUserConversationMessageList(
+    conversationId: string,
+    userId: string,
+    pagination: PaginationOptions,
+  ): Promise<PaginatedResult<MessageReadDto>> {
+    const [messages, count, deletedForMeReplyIds] =
+      await this.dataSource.transaction(async (entityManager) => {
+        const [rows, totalCount] = await entityManager
+          .getRepository(Message)
+          .createQueryBuilder('m')
+          .innerJoinAndSelect('m.sender', 'cm')
+          .leftJoinAndSelect('m.reply_to_message', 'rm')
+          .leftJoinAndSelect('rm.sender', 'rm_sender')
+          .where('m.conversation_id = :conversationId', { conversationId })
+          .andWhere(() => {
+            const sq = entityManager
+              .getRepository(DeletedMessage)
+              .createQueryBuilder('dm')
+              .where('dm.user_id = :userId')
+              .andWhere('dm.message_id = m.id')
+              .getQuery();
+
+            return `NOT EXISTS (${sq})`;
+          })
+          .setParameter('userId', userId)
+          .orderBy('m.created_at', 'DESC')
+          .offset(pagination.offset)
+          .limit(pagination.limit)
+          .getManyAndCount();
+
+        const replyIds = rows
+          .map((m) => m.reply_to_message_id)
+          .filter((id): id is string => Boolean(id));
+
+        const deletedReplySet = new Set<string>();
+        if (replyIds.length > 0) {
+          const deletedReplyMessages = await entityManager
+            .getRepository(DeletedMessage)
+            .find({
+              where: {
+                user_id: userId,
+                message_id: In(replyIds),
+              },
+            });
+          deletedReplyMessages.forEach((dm) =>
+            deletedReplySet.add(dm.message_id),
+          );
+        }
+
+        return [rows, totalCount, deletedReplySet] as const;
+      });
+
+    const dtos: MessageReadDto[] = messages.map((m) => {
+      const rm = m.reply_to_message;
+      let replyTo = null;
+      if (rm) {
+        const isDeletedForEveryone = rm.deleted_at != null;
+        const isDeletedForMe = deletedForMeReplyIds.has(rm.id);
+        const isDeleted = isDeletedForEveryone || isDeletedForMe;
+
+        replyTo = {
+          id: rm.id,
+          text: isDeleted ? null : rm.text,
+          type: rm.type,
+          senderId: rm.sender ? rm.sender.user_id : rm.sender_id,
+          createdAt: rm.created_at.toISOString(),
+          deletedAt: isDeletedForEveryone
+            ? rm.deleted_at!.toISOString()
+            : isDeletedForMe
+              ? new Date().toISOString()
+              : null,
+        };
+      }
+
+      return {
+        id: m.id,
+        text: m.deleted_at ? '' : m.text,
+        type: m.type,
+        senderId: m.sender ? m.sender.user_id : m.sender_id,
+        createdAt: m.created_at.toISOString(),
+        editedAt: m.edited_at ? m.edited_at.toISOString() : null,
+        deletedAt: m.deleted_at ? m.deleted_at.toISOString() : null,
+        replyToMessageId: m.reply_to_message_id ?? null,
+        replyTo,
+        clientMessageId: m.client_message_id ?? null,
+      };
+    });
+
+    return PaginationHelper.createResult(dtos, count, pagination);
+  }
+}

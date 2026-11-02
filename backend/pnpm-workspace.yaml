@@ -1,0 +1,7 @@
+allowBuilds:
+  '@parcel/watcher': true
+  '@scarf/scarf': true
+  bcrypt: true
+  cpu-features: true
+  protobufjs: true
+  ssh2: true
