@@ -39,11 +39,15 @@ Open a terminal in `backend`:
 ```powershell
 cd backend
 pnpm install
-Copy-Item .env.example .env
+# Copy-Item .env.example .env (if you need to set up own env variables)
+```
+# Optional run backend tests
+
+```powershell
+pnpm test
 ```
 
 Edit `.env` with the PostgreSQL connection details and authentication key paths.
-Do not commit `.env` or private key files.
 
 The authentication key files expected by the development configuration are:
 
